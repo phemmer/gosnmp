@@ -61,7 +61,7 @@ func (x *GoSNMP) decodeValue(data []byte, msg string) (retVal *variable, err err
 		}
 		length, cursor := parseLength(data)
 		retVal.Type = OctetString
-		retVal.Value = []byte(data[cursor:length])
+		retVal.Value = append([]byte(nil), data[cursor:length]...)
 	case Null:
 		// 0x05
 		if x.loggingEnabled {
