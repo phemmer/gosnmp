@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -1274,5 +1275,109 @@ func BenchmarkSendOneRequest(b *testing.B) {
 			b.Fatalf("Error: %s", err)
 			return
 		}
+	}
+}
+
+/*
+octetResp:
+Simple Network Management Protocol
+	version: v2c (1)
+	community: public
+	data: get-response (2)
+		get-response
+			request-id: 383358266
+			error-status: noError (0)
+			error-index: 0
+			variable-bindings: 1 item
+				1.2.3.4.5.6.7.8.9: 61626364656667686a696b6c6d6e6f707172737475767778...
+					Object Name: 1.2.3.4.5.6.7.8.9 (iso.2.3.4.5.6.7.8.9)
+					Value (OctetString): 61626364656667686a696b6c6d6e6f707172737475767778...
+						("abcdefghijklmnopqrstuvwxyz")
+*/
+func octetResp() []byte {
+	return []byte{
+		0x30, 0x43, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0xa2, 0x36, 0x02,
+		0x04, 0x16, 0xd9, 0x95, 0x3a, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x28, 0x30, 0x26, 0x06,
+		0x08, 0x2a, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x04, 0x1a, 0x61, 0x62, 0x63, 0x64, 0x65,
+		0x66, 0x67, 0x68, 0x6a, 0x69, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75,
+		0x76, 0x77, 0x78, 0x79, 0x7a,
+	}
+}
+
+func TestSendOneRequest_memory(t *testing.T) {
+	srvr, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	defer srvr.Close()
+
+	x := &GoSNMP{
+		Version: Version2c,
+		Target:  srvr.LocalAddr().(*net.UDPAddr).IP.String(),
+		Port:    uint16(srvr.LocalAddr().(*net.UDPAddr).Port),
+		Timeout: time.Millisecond * 100,
+		Retries: 2,
+	}
+	if err := x.Connect(); err != nil {
+		t.Fatalf("Error connecting: %s", err)
+	}
+
+	go func() {
+		buf := make([]byte, 256)
+		outBuf := octetResp()
+		for {
+			_, addr, err := srvr.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+
+			copy(outBuf[17:21], buf[11:15]) // evil: copy request ID
+			srvr.WriteTo(outBuf, addr)
+		}
+	}()
+
+	reqPkt := x.mkSnmpPacket(GetRequest, 0, 0)
+	reqPkt.Variables = []SnmpPDU{{Name: ".1.2.3.4.5.6.7.8.9", Type: Null}}
+
+	// make sure everything works before starting the test
+	_, err = x.send(reqPkt.Variables, reqPkt)
+	if err != nil {
+		t.Fatalf("Precheck failed: %s", err)
+	}
+
+	const N = 1000
+	var resps [N]*SnmpPacket
+
+	var m1, m2, m3 runtime.MemStats
+	// run the whole thing twice, capture the last result
+	for i := 0; i < 2; i++ {
+		runtime.GC()
+		runtime.ReadMemStats(&m1)
+
+		for n := 0; n < N; n++ {
+			resps[n], err = x.send(reqPkt.Variables, reqPkt)
+			if err != nil {
+				t.Fatalf("Error: %s", err)
+				return
+			}
+		}
+
+		runtime.GC()
+		runtime.ReadMemStats(&m2)
+
+		for n := 0; n < N; n++ {
+			resps[n] = nil
+		}
+
+		runtime.GC()
+		runtime.ReadMemStats(&m3)
+	}
+
+	memUsedPerRequest := (m2.HeapAlloc - m1.HeapAlloc) / N
+	memLeakedPerRequest := (m3.HeapAlloc - m1.HeapAlloc) / N
+	fmt.Printf("Mem used per request: %d\n", memUsedPerRequest)
+	if memUsedPerRequest > 500 { // 480 as of when this was written. Will need to be adjusted if we add more info to responses.
+		t.Errorf("Memory used per request > 500 bytes. Actual = %d", memUsedPerRequest)
+	}
+	fmt.Printf("Mem leaked per request: %d\n", memLeakedPerRequest)
+	if memLeakedPerRequest > 10 { // allow for a margin of error in calculation
+		t.Errorf("Memory leaked per request > 10 bytes. Actual = %d", memLeakedPerRequest)
 	}
 }
