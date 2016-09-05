@@ -8,7 +8,10 @@ import (
 	"bytes"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1196,7 +1199,7 @@ func counter64Response() []byte {
 	}
 }
 
-func TestSendOneRequest_dups(t *testing.T) {
+func TestResponseReceiver(t *testing.T) {
 	srvr, err := net.ListenUDP("udp4", &net.UDPAddr{})
 	defer srvr.Close()
 
@@ -1211,53 +1214,162 @@ func TestSendOneRequest_dups(t *testing.T) {
 		t.Fatalf("Error connecting: %s", err)
 	}
 
+	c := make(chan chanResponse, 1)
+	buf := counter64Response()
+	x.recvChansMtx.Lock() // not needed, but race detector complains
+	x.recvChans[190378322] = c
+	x.recvChansMtx.Unlock()
+	srvr.WriteTo(buf, x.Conn.LocalAddr())
+
+	cresp := <-c
+	if cresp.err != nil {
+		t.Fatalf("error during receive: %s", err)
+	}
+
+	resp := cresp.SnmpPacket
+	if resp.RequestID != 190378322 {
+		t.Errorf("did not receive proper response")
+	}
+
+	if len(x.recvChans) != 0 {
+		t.Errorf("receiver was not removed from list")
+	}
+}
+
+func TestResponseReceiver_closed(t *testing.T) {
+	x := &GoSNMP{
+		Version: Version2c,
+		Target:  "127.0.0.1",
+		Port:    1,
+		Timeout: time.Millisecond * 100,
+		Retries: 2,
+	}
+	if err := x.Connect(); err != nil {
+		t.Fatalf("Error connecting: %s", err)
+	}
+
+	c := make(chan chanResponse, 1)
+	x.recvChansMtx.Lock() // not needed, but race detector complains
+	x.recvChans[1] = c
+	x.recvChansMtx.Unlock()
+
+	x.Conn.Close()
+	cresp := <-c
+	err := cresp.err
+	if err == nil {
+		t.Fatalf("expected error but none received")
+	}
+	if err, ok := err.(*net.OpError); !ok {
+		t.Fatalf("expected *net.OpError but received %T: %s", err, err)
+	} else if !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Errorf("expected closed network connection error, but received: %s", err)
+	}
+}
+
+// In this test, we fire off 1000 requests to the embedded test server, which
+// responds in random order. The test ensures that we receive all the proper responses.
+func TestRequestReceive_parallel(t *testing.T) {
+	// Setup the server
+	srvr, _ := net.ListenUDP("udp4", &net.UDPAddr{})
+	defer srvr.Close()
+
+	x := &GoSNMP{
+		Version: Version2c,
+		Target:  srvr.LocalAddr().(*net.UDPAddr).IP.String(),
+		Port:    uint16(srvr.LocalAddr().(*net.UDPAddr).Port),
+		Timeout: time.Second,
+		Retries: 2,
+	}
+	if err := x.Connect(); err != nil {
+		t.Fatalf("Error connecting: %s", err)
+	}
+
 	go func() {
 		buf := make([]byte, 256)
 		for {
-			n, addr, err := srvr.ReadFrom(buf)
+			_, addr, err := srvr.ReadFrom(buf)
 			if err != nil {
 				return
 			}
-			buf := buf[:n]
 
-			var reqPkt SnmpPacket
-			err = x.unmarshal(buf, &reqPkt)
-			if err != nil {
-				t.Errorf("Error: %s", err)
-			}
-			rspPkt := x.mkSnmpPacket(GetResponse, 0, 0)
-			rspPkt.RequestID = reqPkt.RequestID
-			rspPkt.Variables = []SnmpPDU{
-				{
-					Name:  ".1.2",
-					Type:  Integer,
-					Value: 123,
-				},
-			}
-			outBuf, err := rspPkt.marshalMsg(rspPkt.Variables, rspPkt.PDUType, rspPkt.MsgID, rspPkt.RequestID)
-			if err != nil {
-				t.Errorf("ERR: %s", err)
-			}
-			srvr.WriteTo(outBuf, addr)
-			for i := 0; i <= x.Retries; i++ {
+			outBuf := counter64Response()
+			copy(outBuf[17:21], buf[11:15]) // evil: copy request ID
+
+			// sleep a random amount of time up to 10ms before responding
+			go func() {
+				time.Sleep(time.Duration(rand.Int63n(int64(time.Millisecond * 10))))
 				srvr.WriteTo(outBuf, addr)
-			}
+			}()
 		}
 	}()
 
-	reqPkt := x.mkSnmpPacket(GetResponse, 0, 0) //not actually a GetResponse, but we need something our test server can unmarshal
-	reqPDU := SnmpPDU{Name: ".1.2", Type: Null}
+	// do the test
+	wg := sync.WaitGroup{}
+	wg.Add(1000)
+	for i := 0; i < 1000; i++ {
+		i := i
+		reqPkt := x.mkSnmpPacket(GetResponse, 0, 0) //not actually a GetResponse, but we need something our test server can unmarshal
+		reqPkt.Variables = []SnmpPDU{SnmpPDU{Name: ".1.2", Type: Null}}
+		go func() {
+			if _, err := x.requestReceive(reqPkt); err != nil {
+				t.Errorf("Error (%03d): %s", i, err)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+}
 
-	_, err = x.sendOneRequest([]SnmpPDU{reqPDU}, reqPkt, true)
-	if err != nil {
-		t.Errorf("Error: %s", err)
-		return
+func TestRequestReceive_timeouts(t *testing.T) {
+	// Setup the server
+	srvr, _ := net.ListenUDP("udp4", &net.UDPAddr{})
+	defer srvr.Close()
+
+	x := &GoSNMP{
+		Version: Version2c,
+		Target:  srvr.LocalAddr().(*net.UDPAddr).IP.String(),
+		Port:    uint16(srvr.LocalAddr().(*net.UDPAddr).Port),
+		Timeout: 50 * time.Millisecond,
+		Retries: 2,
+	}
+	if err := x.Connect(); err != nil {
+		t.Fatalf("Error connecting: %s", err)
 	}
 
-	_, err = x.sendOneRequest([]SnmpPDU{reqPDU}, reqPkt, true)
-	if err != nil {
-		t.Errorf("Error: %s", err)
-		return
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	recvCount := 0
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 256)
+		for {
+			_, _, err := srvr.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			recvCount++
+		}
+	}()
+
+	start := time.Now()
+	reqPkt := x.mkSnmpPacket(GetResponse, 0, 0) //not actually a GetResponse, but we need something our test server can unmarshal
+	reqPkt.Variables = []SnmpPDU{SnmpPDU{Name: ".1.2", Type: Null}}
+	_, err := x.requestReceive(reqPkt)
+	stop := time.Now()
+
+	if err == nil || err.Error() != "timeout waiting for response" {
+		t.Errorf("expected timeout error, but received: %#v", err)
+	}
+
+	if stop.Sub(start) < x.Timeout {
+		t.Errorf("timed out too early")
+	}
+
+	srvr.Close()
+	wg.Wait()
+
+	if recvCount != x.Retries+1 {
+		t.Errorf("expected %d requests, but had %d", x.Retries+1, recvCount)
 	}
 }
 

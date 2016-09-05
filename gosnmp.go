@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -79,7 +80,9 @@ type GoSNMP struct {
 	requestID uint32
 	random    *rand.Rand
 
-	rxBuf *[rxBufSize]byte // has to be pointer due to https://github.com/golang/go/issues/11728
+	rxBuf        *[rxBufSize]byte // has to be pointer due to https://github.com/golang/go/issues/11728
+	recvChans    map[uint32]chan chanResponse
+	recvChansMtx sync.Mutex
 
 	// MsgFlags is an SNMPV3 MsgFlags
 	MsgFlags SnmpV3MsgFlags
@@ -214,6 +217,8 @@ func (x *GoSNMP) Connect() error {
 	x.requestID = x.random.Uint32()
 
 	x.rxBuf = new([rxBufSize]byte)
+	x.recvChans = map[uint32]chan chanResponse{}
+	go x.responseReceiver()
 
 	if x.Version == Version3 {
 		if err = x.setSalt(); err != nil {

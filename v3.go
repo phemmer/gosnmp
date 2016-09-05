@@ -238,18 +238,15 @@ were affecting the legibility of the main code. Some of the function names may
 not reflect their true purpose. Sonia.
 */
 
-func (x *GoSNMP) buildPacket3(msgID uint32, allMsgIDs []uint32,
-	packetOut *SnmpPacket) (*SnmpPacket, error) {
-	msgID = atomic.AddUint32(&(x.msgID), 1) // TODO: fix overflows
-	allMsgIDs = append(allMsgIDs, msgID)
-
+func (x *GoSNMP) buildPacket3(packetOut *SnmpPacket) error {
+	packetOut.MsgID = atomic.AddUint32(&(x.msgID), 1) // TODO: fix overflows
 	// http://tools.ietf.org/html/rfc2574#section-8.1.1.1
 	// localDESSalt needs to be incremented on every packet.
 	if x.MsgFlags&AuthPriv > AuthNoPriv && x.SecurityModel == UserSecurityModel {
 		baseSecParams, ok := x.SecurityParameters.(*UsmSecurityParameters)
 		if !ok || baseSecParams == nil {
 			err := fmt.Errorf("&GoSNMP.SecurityModel indicates the User Security Model, but &GoSNMP.SecurityParameters is not of type &UsmSecurityParameters")
-			return nil, err
+			return err
 		}
 		var newPktLocalAESSalt uint64
 		var newPktLocalDESSalt uint32
@@ -265,7 +262,7 @@ func (x *GoSNMP) buildPacket3(msgID uint32, allMsgIDs []uint32,
 			pktSecParams, ok := packetOut.SecurityParameters.(*UsmSecurityParameters)
 			if !ok || baseSecParams == nil {
 				err := fmt.Errorf("packetOut.SecurityModel indicates the User Security Model, but packetOut.SecurityParameters is not of type &UsmSecurityParameters")
-				return nil, err
+				return err
 			}
 
 			switch pktSecParams.PrivacyProtocol {
@@ -281,7 +278,7 @@ func (x *GoSNMP) buildPacket3(msgID uint32, allMsgIDs []uint32,
 			}
 		}
 	}
-	return packetOut, nil
+	return nil
 }
 
 func (x *GoSNMP) setSalt() error {

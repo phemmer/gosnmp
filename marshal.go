@@ -158,111 +158,19 @@ type Logger interface {
 // send/receive one snmp request
 func (x *GoSNMP) sendOneRequest(pdus []SnmpPDU, packetOut *SnmpPacket,
 	wait bool) (result *SnmpPacket, err error) {
-	finalDeadline := time.Now().Add(x.Timeout)
+	packetOut.Variables = pdus
 
-	allReqIDs := make([]uint32, 0, x.Retries+1)
-	allMsgIDs := make([]uint32, 0, x.Retries+1)
-	for retries := 0; ; retries++ {
-		if retries > 0 {
-			if x.loggingEnabled {
-				x.Logger.Printf("Retry number %d. Last error was: %v", retries, err)
-			}
-			if time.Now().After(finalDeadline) {
-				err = fmt.Errorf("Request timeout (after %d retries)", retries-1)
-				break
-			}
-			if retries > x.Retries {
-				// Report last error
-				break
-			}
+	if x.Version == Version3 {
+		if err := x.buildPacket3(packetOut); err != nil {
+			return &SnmpPacket{}, err
 		}
-		err = nil
-
-		reqDeadline := time.Now().Add(x.Timeout / time.Duration(x.Retries+1))
-		x.Conn.SetDeadline(reqDeadline)
-
-		// Request ID is an atomic counter (started at a random value)
-		reqID := atomic.AddUint32(&(x.requestID), 1) // TODO: fix overflows
-		allReqIDs = append(allReqIDs, reqID)
-
-		var msgID uint32
-		if x.Version == Version3 {
-			packetOut, err = x.buildPacket3(msgID, allMsgIDs, packetOut)
-			if err != nil {
-				break
-			}
-		}
-
-		var outBuf []byte
-		outBuf, err = packetOut.marshalMsg(pdus, packetOut.PDUType, msgID, reqID)
-		if err != nil {
-			// Don't retry - not going to get any better!
-			err = fmt.Errorf("marshal: %v", err)
-			break
-		}
-
-		_, err = x.Conn.Write(outBuf)
-		if err != nil {
-			continue
-		}
-
-		// all sends wait for the return packet, except for SNMPv2Trap
-		if wait == false {
-			return &SnmpPacket{}, nil
-		}
-
-		for {
-			// Receive response and try receiving again on any decoding error.
-			// Let the deadline abort us if we don't receive a valid response.
-
-			var resp []byte
-			resp, err = x.receive()
-			if err != nil {
-				// receive error. retrying won't help. abort
-				break
-			}
-			result = new(SnmpPacket)
-			result.Logger = x.Logger
-			result.MsgFlags = packetOut.MsgFlags
-			if packetOut.SecurityParameters != nil {
-				result.SecurityParameters = packetOut.SecurityParameters.Copy()
-			}
-			err = x.unmarshal(resp, result)
-			if err != nil {
-				err = fmt.Errorf("Unable to decode packet: %s", err.Error())
-				continue
-			}
-			if result == nil || len(result.Variables) < 1 {
-				err = fmt.Errorf("Unable to decode packet: nil")
-				continue
-			}
-
-			validID := false
-			for _, id := range allReqIDs {
-				if id == result.RequestID {
-					validID = true
-				}
-			}
-			if result.RequestID == 0 {
-				validID = true
-			}
-			if !validID {
-				err = fmt.Errorf("Out of order response")
-				continue
-			}
-
-			break
-		}
-		if err != nil {
-			continue
-		}
-
-		// Success!
-		return result, nil
 	}
 
-	// Return last error
-	return nil, err
+	if wait {
+		return x.requestReceive(packetOut)
+	} else {
+		return &SnmpPacket{}, x.request(packetOut)
+	}
 }
 
 // generic "sender" that negotiate any version of snmp request
@@ -309,6 +217,117 @@ func (x *GoSNMP) send(pdus []SnmpPDU,
 		}
 	}
 	return result, err
+}
+
+type chanResponse struct {
+	*SnmpPacket
+	err error
+}
+
+// receive response from network and read into a byte array
+func (x *GoSNMP) receive() ([]byte, error) {
+	n, err := x.Conn.Read(x.rxBuf[:])
+	if err != nil {
+		return nil, err
+	}
+
+	if n == rxBufSize {
+		// This should never happen unless we're using something like a unix domain socket.
+		return nil, fmt.Errorf("response buffer too small")
+	}
+
+	resp := make([]byte, n)
+	copy(resp, x.rxBuf[:n])
+	return resp, nil
+}
+
+// requestReceive sends a request off and waits for the response.
+// Retries are sent every `x.Timeout / (x.Retries + 1)`.
+func (x *GoSNMP) requestReceive(pkt *SnmpPacket) (*SnmpPacket, error) {
+	reqID := atomic.AddUint32(&(x.requestID), 1)
+	pktBuf, err := pkt.marshalMsg(pkt.Variables, pkt.PDUType, pkt.MsgID, reqID)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %s", err)
+	}
+
+	c := make(chan chanResponse, 1)
+
+	x.recvChansMtx.Lock()
+	x.recvChans[reqID] = c
+	x.recvChansMtx.Unlock()
+
+	tck := time.NewTicker(x.Timeout / time.Duration(x.Retries+1))
+	defer tck.Stop()
+	for retries := 0; ; retries++ {
+		if _, err := x.Conn.Write(pktBuf); err != nil {
+			x.recvChansMtx.Lock()
+			delete(x.recvChans, reqID)
+			x.recvChansMtx.Unlock()
+			return nil, fmt.Errorf("error sending request")
+		}
+
+		select {
+		case <-tck.C:
+			if retries >= x.Retries {
+				x.recvChansMtx.Lock()
+				delete(x.recvChans, reqID)
+				x.recvChansMtx.Unlock()
+				return nil, fmt.Errorf("timeout waiting for response")
+			}
+		case rsp := <-c:
+			return rsp.SnmpPacket, rsp.err
+		}
+	}
+}
+
+// responseReceiver listens on the socket and dispatches incoming SNMP packets to the registered receivers.
+func (x *GoSNMP) responseReceiver() (err error) {
+	defer func() {
+		x.recvChansMtx.Lock()
+		x.Conn.Close()
+		for reqID, c := range x.recvChans {
+			delete(x.recvChans, reqID)
+			c <- chanResponse{nil, err}
+		}
+		x.recvChansMtx.Unlock()
+	}()
+
+	for {
+		resp, err := x.receive()
+		if err != nil {
+			if err, ok := err.(*net.OpError); ok && !err.Temporary() {
+				return err
+			}
+			continue
+		}
+
+		result := &SnmpPacket{}
+		if err := x.unmarshal(resp, result); err != nil {
+			x.Logger.Printf("error decoding packet: %s\n", err)
+			continue
+		}
+
+		x.recvChansMtx.Lock()
+		c := x.recvChans[result.RequestID]
+		if c != nil {
+			delete(x.recvChans, result.RequestID)
+			c <- chanResponse{result, nil}
+		}
+		x.recvChansMtx.Unlock()
+	}
+}
+
+// request sends the packet off without waiting for a response
+func (x *GoSNMP) request(pkt *SnmpPacket) error {
+	reqID := atomic.AddUint32(&(x.requestID), 1)
+	pktBuf, err := pkt.marshalMsg(pkt.Variables, pkt.PDUType, pkt.MsgID, reqID)
+	if err != nil {
+		return fmt.Errorf("marshal: %s", err)
+	}
+	if _, err := x.Conn.Write(pktBuf); err != nil {
+		return fmt.Errorf("error sending request")
+	}
+	return nil
 }
 
 // -- Marshalling Logic --------------------------------------------------------
@@ -1009,21 +1028,4 @@ func (x *GoSNMP) unmarshalVBL(packet []byte, response *SnmpPacket,
 		response.Variables = append(response.Variables, SnmpPDU{oidStr, v.Type, v.Value, x.Logger})
 	}
 	return response, nil
-}
-
-// receive response from network and read into a byte array
-func (x *GoSNMP) receive() ([]byte, error) {
-	n, err := x.Conn.Read(x.rxBuf[:])
-	if err != nil {
-		return nil, fmt.Errorf("Error reading from UDP: %s", err.Error())
-	}
-
-	if n == rxBufSize {
-		// This should never happen unless we're using something like a unix domain socket.
-		return nil, fmt.Errorf("response buffer too small")
-	}
-
-	resp := make([]byte, n)
-	copy(resp, x.rxBuf[:n])
-	return resp, nil
 }
